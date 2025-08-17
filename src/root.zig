@@ -27,14 +27,6 @@ pub export fn luaopen_xev(l: ?*zlj.c.lua_State) callconv(.c) c_int {
         file.set("open", File.open);
     }
 
-    // Completion.
-    {
-        lua.newTable();
-        const completion = lua.toAnyType(zlj.TableRef, -1).?;
-        mod.set("Completion", completion);
-        completion.set("new", Completion.new);
-    }
-
     // ReadBuffer.
     {
         lua.newTable();
@@ -46,11 +38,15 @@ pub export fn luaopen_xev(l: ?*zlj.c.lua_State) callconv(.c) c_int {
     return 0;
 }
 
+fn getAlloc(lua: zlj.State) std.mem.Allocator {
+    return (lua.allocator() orelse &std.heap.c_allocator).*;
+}
+
 const Loop = struct {
     const Self = @This();
     const tname = "xev.Loop";
 
-    fn new(lua: zlj.State) c_int {
+    fn new(lua: zlj.State) !c_int {
         const loop = lua.newUserData(xev.Loop);
 
         if (lua.newMetaTable(xev.Loop, Self.tname)) {
@@ -73,16 +69,16 @@ const Loop = struct {
         }
         lua.setMetaTable(1);
 
-        loop.* = xev.Loop.init(.{}) catch |err| lua.raiseError(err);
+        loop.* = try xev.Loop.init(.{});
 
         return 1;
     }
 
-    fn run(lua: zlj.State) c_int {
+    fn run(lua: zlj.State) !c_int {
         const loop = lua.checkUserData(1, xev.Loop, Self.tname);
         const mode = lua.checkEnum(2, xev.RunMode, null);
 
-        loop.run(mode) catch |err| lua.raiseError(err);
+        try loop.run(mode);
 
         return 0;
     }
@@ -112,6 +108,10 @@ const File = struct {
                 const index = lua.toAnyType(zlj.TableRef, -1).?;
                 defer lua.pop(1);
                 index.set("read", Self.read);
+                index.set("pread", Self.pread);
+                index.set("write", Self.write);
+                index.set("pwrite", Self.pwrite);
+                index.set("close", Self.close);
                 mt.set("__index", index);
             }
         }
@@ -122,26 +122,19 @@ const File = struct {
         return 1;
     }
 
-    pub fn read(lua: zlj.State) c_int {
+    pub fn read(lua: zlj.State) !c_int {
         const f = lua.checkUserData(1, xev.File, Self.tname);
         const loop = lua.checkUserData(2, xev.Loop, Loop.tname);
-        const c = lua.checkUserData(3, xev.Completion, Completion.tname);
-        const rb = lua.checkUserData(4, []u8, Buffer.tname);
-        lua.checkValueType(5, .function); // Callback.
+        const buf = lua.checkUserData(3, Buffer, Buffer.tname);
+        lua.checkValueType(4, .function); // Callback.
+        lua.setTop(4);
 
-        // Remove extra args.
-        if (lua.top() > 5) lua.pop(lua.top() - 5);
+        const callback = try ReadCallback.init(lua);
 
-        const alloc = (lua.allocator() orelse &std.heap.c_allocator).*;
-        const callback = ReadCallback.init(alloc, lua) catch |err| {
-            lua.raiseError(err);
-        };
-
-        // Add read task.
         f.read(
             loop,
-            c,
-            .{ .slice = rb.* },
+            try getAlloc(lua).create(xev.Completion),
+            .{ .slice = buf.slice },
             ReadCallback,
             callback,
             ReadCallback.readCallback,
@@ -149,34 +142,92 @@ const File = struct {
 
         return 0;
     }
-};
 
-const Completion = struct {
-    const Self = @This();
-    const tname = "xev.Completion";
+    pub fn pread(lua: zlj.State) !c_int {
+        const f = lua.checkUserData(1, xev.File, Self.tname);
+        const loop = lua.checkUserData(2, xev.Loop, Loop.tname);
+        const buf = lua.checkUserData(3, Buffer, Buffer.tname);
+        const offset: usize = @intCast(lua.checkLong(4));
+        lua.checkValueType(5, .function); // Callback.
+        lua.setTop(5);
 
-    pub fn new(lua: zlj.State) c_int {
-        _ = lua.newUserData(xev.Completion);
+        // Remove offset from stack.
+        lua.remove(4);
+        const callback = try ReadCallback.init(lua);
+        f.pread(
+            loop,
+            try getAlloc(lua).create(xev.Completion),
+            .{ .slice = buf.slice },
+            offset,
+            ReadCallback,
+            callback,
+            ReadCallback.readCallback,
+        );
 
-        if (lua.newMetaTable(xev.Completion, Self.tname)) {
-            const mt = lua.toAnyType(zlj.TableRef, -1).?;
+        return 0;
+    }
 
-            // Meta methods.
-            {
-                mt.set("__metatable", false);
-            }
+    pub fn write(lua: zlj.State) !c_int {
+        const f = lua.checkUserData(1, xev.File, Self.tname);
+        const loop = lua.checkUserData(2, xev.Loop, Loop.tname);
+        const str = lua.checkString(3);
+        lua.checkValueType(4, .function); // Callback.
+        lua.setTop(4);
 
-            // Create __index table.
-            {
-                lua.newTable();
-                const index = lua.toAnyType(zlj.TableRef, -1).?;
-                defer lua.pop(1);
-                mt.set("__index", index);
-            }
-        }
-        lua.setMetaTable(1);
+        const callback = try WriteCallback.init(lua);
+        f.write(
+            loop,
+            try getAlloc(lua).create(xev.Completion),
+            .{ .slice = str },
+            WriteCallback,
+            callback,
+            WriteCallback.writeCallback,
+        );
 
-        return 1;
+        return 0;
+    }
+
+    pub fn pwrite(lua: zlj.State) !c_int {
+        const f = lua.checkUserData(1, xev.File, Self.tname);
+        const loop = lua.checkUserData(2, xev.Loop, Loop.tname);
+        const str = lua.checkString(3);
+        const offset: usize = @intCast(lua.checkLong(4));
+        lua.checkValueType(5, .function); // Callback.
+        lua.setTop(5);
+
+        const callback = try WriteCallback.init(lua);
+        f.pwrite(
+            loop,
+            try getAlloc(lua).create(xev.Completion),
+            .{ .slice = str },
+            offset,
+            WriteCallback,
+            callback,
+            WriteCallback.writeCallback,
+        );
+
+        return 0;
+    }
+
+    pub fn close(lua: zlj.State) !c_int {
+        const f = lua.checkUserData(1, xev.File, Self.tname);
+        const loop = lua.checkUserData(2, xev.Loop, Loop.tname);
+        lua.checkValueType(3, zlj.ValueType.function); // Callback.
+
+        // Remove extra args.
+        if (lua.top() > 3) lua.pop(lua.top() - 3);
+
+        const callback = try CloseCallback.init(lua);
+
+        f.close(
+            loop,
+            try getAlloc(lua).create(xev.Completion),
+            CloseCallback,
+            callback,
+            CloseCallback.closeCallback,
+        );
+
+        return 0;
     }
 };
 
@@ -187,13 +238,13 @@ const Buffer = struct {
     slice: []u8,
     len: usize = 0,
 
-    pub fn new(lua: zlj.State) c_int {
-        const size = lua.optInteger(1, 4096);
-        if (size < 0) lua.raiseError(error.NegativeSize);
+    pub fn new(lua: zlj.State) !c_int {
+        var size = lua.optInteger(1, 4096);
+        if (size < 0) size = 0;
 
         const self = lua.newUserData(Self);
         const alloc = (lua.allocator() orelse &std.heap.c_allocator).*;
-        self.slice = alloc.alloc(u8, @intCast(size)) catch |err| lua.raiseError(err);
+        self.slice = try alloc.alloc(u8, @intCast(size));
 
         if (lua.newMetaTable(xev.Completion, Self.tname)) {
             const mt = lua.toAnyType(zlj.TableRef, -1).?;
@@ -241,8 +292,9 @@ const ReadCallback = struct {
     cb_ref: c_int,
     buf_ref: c_int,
 
-    /// Initialize a Callback using function on top of the stack.
-    pub fn init(alloc: std.mem.Allocator, lua: zlj.State) !*Self {
+    /// Initialize a Callback using function and buffer on top of the stack.
+    pub fn init(lua: zlj.State) !*Self {
+        const alloc = getAlloc(lua);
         const self = try alloc.create(Self);
         self.alloc = alloc;
         self.lua = lua;
@@ -260,7 +312,7 @@ const ReadCallback = struct {
     pub fn readCallback(
         ud: ?*ReadCallback,
         _: *xev.Loop,
-        _: *xev.Completion,
+        c: *xev.Completion,
         _: xev.File,
         _: xev.ReadBuffer,
         r: xev.ReadError!usize,
@@ -284,200 +336,105 @@ const ReadCallback = struct {
         if (self.lua.toBoolean(-1)) return .rearm;
 
         self.deinit();
+        self.alloc.destroy(c);
 
         return .disarm;
     }
 };
 
-// fn loopDeinit(lua: LuaState) callconv(.c) c_int {
-//     const loop: *xev.Loop = @ptrCast(@alignCast(c.luaL_checkudata(lua, 1, "xev.Loop").?));
-//     _ = loop;
-//     // loop.deinit();
-//     return 0;
-// }
-//
-// fn loopStop(lua: LuaState) callconv(.c) c_int {
-//     const sg = StackGuard.init(lua);
-//     defer sg.check(0);
-//
-//     const loop: *xev.Loop = @ptrCast(@alignCast(c.luaL_checkudata(lua, 1, "xev.Loop").?));
-//     loop.stop();
-//     return 0;
-// }
-//
-// fn loopStopped(lua: LuaState) callconv(.c) c_int {
-//     const sg = StackGuard.init(lua);
-//     defer sg.check(1);
-//
-//     const loop: *xev.Loop = @ptrCast(@alignCast(c.luaL_checkudata(lua, 1, "xev.Loop").?));
-//     c.lua_pushboolean(lua, @intFromBool(loop.stopped()));
-//     return 1;
-// }
-//
-// fn loopAdd(lua: LuaState) callconv(.c) c_int {
-//     const sg = StackGuard.init(lua);
-//     defer sg.check(0);
-//
-//     const loop: *xev.Loop = @ptrCast(@alignCast(c.luaL_checkudata(lua, 1, "xev.Loop").?));
-//     const comp: *xev.Completion = @ptrCast(@alignCast(c.luaL_checkudata(lua, 2, "xev.Completion").?));
-//
-//     loop.add(comp);
-//
-//     return 0;
-// }
-//
-// fn loopSubmit(lua: LuaState) callconv(.c) c_int {
-//     const sg = StackGuard.init(lua);
-//     defer sg.check(0);
-//
-//     const loop: *xev.Loop = @ptrCast(@alignCast(c.luaL_checkudata(lua, 1, "xev.Loop").?));
-//     loop.submit() catch |err| return c.luaL_error(lua, @errorName(err));
-//
-//     return 0;
-// }
-//
-// fn loopRun(lua: LuaState) callconv(.c) c_int {
-//     const sg = StackGuard.init(lua);
-//     defer sg.check(0);
-//
-//     const loop: *xev.Loop = @ptrCast(@alignCast(c.luaL_checkudata(lua, 1, "xev.Loop").?));
-//     const mode_str = checkString(lua, 2);
-//
-//     var mode: xev.RunMode = undefined;
-//     if (std.mem.eql(u8, mode_str, "no_wait")) {
-//         mode = .no_wait;
-//     } else if (std.mem.eql(u8, mode_str, "once")) {
-//         mode = .once;
-//     } else if (std.mem.eql(u8, mode_str, "until_done")) {
-//         mode = .until_done;
-//     } else {
-//         return c.luaL_error(lua, "unknown xev.RunMode");
-//     }
-//
-//     loop.run(mode) catch |err| return c.luaL_error(lua, @errorName(err));
-//
-//     return 0;
-// }
-//
-// fn loopTick(lua: LuaState) callconv(.c) c_int {
-//     const sg = StackGuard.init(lua);
-//     defer sg.check(0);
-//
-//     const loop: *xev.Loop = @ptrCast(@alignCast(c.luaL_checkudata(lua, 1, "xev.Loop").?));
-//     const wait: c_long = c.luaL_checkinteger(lua, 2);
-//
-//     if (wait < 0) {
-//         return c.luaL_error(lua, "wait must be positive");
-//     }
-//
-//     loop.tick(@intCast(wait)) catch |err| c.luaL_error(lua, @errorName(err));
-//
-//     return 0;
-// }
-//
-// fn loopNow(lua: LuaState) callconv(.c) c_int {
-//     const sg = StackGuard.init(lua);
-//     defer sg.check(1);
-//
-//     const loop: *xev.Loop = @ptrCast(@alignCast(c.luaL_checkudata(lua, 1, "xev.Loop").?));
-//     c.lua_pushinteger(lua, loop.now());
-//     return 1;
-// }
-//
-// fn loopUpdateNow(lua: LuaState) callconv(.c) c_int {
-//     const sg = StackGuard.init(lua);
-//     defer sg.check(0);
-//
-//     const loop: *xev.Loop = @ptrCast(@alignCast(c.luaL_checkudata(lua, 1, "xev.Loop").?));
-//     loop.update_now();
-//     return 0;
-// }
-//
-// fn loopTimer(lua: LuaState) callconv(.c) c_int {
-//     const sg = StackGuard.init(lua);
-//     defer sg.check(0);
-//
-//     const loop: *xev.Loop = @ptrCast(@alignCast(c.luaL_checkudata(lua, 1, "xev.Loop").?));
-//     const comp: *xev.Completion = @ptrCast(@alignCast(c.luaL_checkudata(lua, 2, "xev.Completion").?));
-//     const next_ms: c.lua_Integer = c.luaL_checkinteger(lua, 3);
-//
-//     if (next_ms < 0 or next_ms > std.math.maxInt(u64)) {
-//         return c.luaL_error(lua, "next_ms must be an integer between 0 and std.math.maxInt(u64)");
-//     }
-//
-//     // REGISTRY[ctx] = callback;
-//     const ctx: *CallbackContext = @ptrCast(@alignCast(c.lua_newuserdata(lua, @sizeOf(CallbackContext))));
-//     c.lua_pushvalue(lua, 5);
-//     c.lua_settable(lua, c.LUA_REGISTRYINDEX);
-//
-//     loop.timer(comp, @intCast(next_ms), ctx, luaCallback);
-//
-//     return 0;
-// }
-//
-// fn loopTimerReset(lua: LuaState) callconv(.c) c_int {
-//     const sg = StackGuard.init(lua);
-//     defer sg.check(0);
-//
-//     const loop: *xev.Loop = @ptrCast(@alignCast(c.luaL_checkudata(lua, 1, "xev.Loop").?));
-//     const comp: *xev.Completion = @ptrCast(@alignCast(c.luaL_checkudata(lua, 2, "xev.Completion").?));
-//     const comp_cancel: *xev.Completion = @ptrCast(@alignCast(c.luaL_checkudata(lua, 3, "xev.Completion").?));
-//     const next_ms: c.lua_Integer = c.luaL_checkinteger(lua, 4);
-//     c.luaL_checktype(lua, 5, c.LUA_TFUNCTION);
-//
-//     if (next_ms < 0 or next_ms > std.math.maxInt(u64)) {
-//         return c.luaL_error(lua, "next_ms must be an integer between 0 and std.math.maxInt(u64)");
-//     }
-//
-//     // REGISTRY[ctx] = callback;
-//     const ctx: *CallbackContext = @ptrCast(@alignCast(c.lua_newuserdata(lua, @sizeOf(CallbackContext))));
-//     c.lua_pushvalue(lua, 5);
-//     c.lua_settable(lua, c.LUA_REGISTRYINDEX);
-//
-//     loop.timer_reset(comp, comp_cancel, @intCast(next_ms), ctx, luaCallback);
-//
-//     return 0;
-// }
-//
-// fn luaCallback(
-//     userdata: ?*anyopaque,
-//     loop: *xev.Loop,
-//     completion: *xev.Completion,
-//     result: xev.Result,
-// ) xev.CallbackAction {
-//     const ctx: *CallbackContext = @ptrCast(@alignCast(userdata.?));
-//     const lua = ctx.lua;
-//
-//     const sg = StackGuard.init(lua);
-//     defer sg.check(0);
-//
-//     // Retrieve REGISTRY[ctx].
-//     c.lua_pushlightuserdata(lua, ctx);
-//     c.lua_gettable(lua, c.LUA_REGISTRYINDEX);
-//     c.luaL_checktype(lua, -1, c.LUA_TFUNCTION);
-//
-//     // Remove REGISTRY[ctx].
-//     c.lua_pushlightuserdata(lua, ctx);
-//     c.lua_pushnil(lua);
-//     c.lua_settable(lua, c.LUA_REGISTRYINDEX);
-//
-//     // Execute callback.
-//     c.lua_pushlightuserdata(lua, loop);
-//     c.luaL_setmetatable(lua, "xev.Loop");
-//     c.lua_pushlightuserdata(lua, completion);
-//     c.luaL_setmetatable(lua, "xev.Completion");
-//     _ = pushCopy(lua, @TypeOf(result), result);
-//     c.lua_call(lua, 3, 1);
-//
-//     const action_str = toString(lua, -1).?;
-//     var action: xev.CallbackAction = undefined;
-//     if (std.mem.eql(u8, action_str, "disarm")) {
-//         action = .disarm;
-//     } else if (std.mem.eql(u8, action_str, "rearm")) {
-//         action = .rearm;
-//     } else {
-//         _ = c.luaL_error(lua, "unknown xev.CallbackAction");
-//     }
-//
-//     return action;
-// }
+const WriteCallback = struct {
+    const Self = @This();
+
+    alloc: std.mem.Allocator,
+    lua: zlj.State,
+    cb_ref: c_int,
+
+    /// Initialize a Callback using function and buffer on top of the stack.
+    pub fn init(lua: zlj.State) !*Self {
+        const alloc = getAlloc(lua);
+        const self = try alloc.create(Self);
+        self.alloc = alloc;
+        self.lua = lua;
+        self.cb_ref = try lua.ref(zlj.Registry);
+        return self;
+    }
+
+    fn deinit(self: *Self) void {
+        self.lua.unref(zlj.Registry, self.cb_ref);
+        self.alloc.destroy(self);
+    }
+
+    pub fn writeCallback(
+        ud: ?*WriteCallback,
+        _: *xev.Loop,
+        c: *xev.Completion,
+        _: xev.File,
+        _: xev.WriteBuffer,
+        r: xev.WriteError!usize,
+    ) xev.CallbackAction {
+        const self = ud.?;
+
+        self.lua.rawGeti(zlj.Registry, self.cb_ref);
+
+        if (r) |write| {
+            self.lua.pushInteger(@intCast(write));
+            self.lua.call(1, 1);
+        } else |err| {
+            self.lua.pushInteger(0);
+            self.lua.pushString(@errorName(err));
+            self.lua.call(2, 1);
+        }
+
+        if (self.lua.toBoolean(-1)) return .rearm;
+
+        self.deinit();
+        self.alloc.destroy(c);
+
+        return .disarm;
+    }
+};
+
+const CloseCallback = struct {
+    const Self = @This();
+
+    alloc: std.mem.Allocator,
+    lua: zlj.State,
+    cb_ref: c_int,
+
+    /// Initialize a Callback using function on top of the stack.
+    pub fn init(lua: zlj.State) !*Self {
+        const alloc = getAlloc(lua);
+        const self = try alloc.create(Self);
+        self.alloc = alloc;
+        self.lua = lua;
+        self.cb_ref = try lua.ref(zlj.Registry);
+        return self;
+    }
+
+    fn deinit(self: *Self) void {
+        self.alloc.destroy(self);
+    }
+
+    pub fn closeCallback(
+        ud: ?*CloseCallback,
+        _: *xev.Loop,
+        c: *xev.Completion,
+        _: xev.File,
+        r: xev.CloseError!void,
+    ) xev.CallbackAction {
+        const self = ud.?;
+        defer self.deinit();
+        defer self.alloc.destroy(c);
+
+        self.lua.rawGeti(zlj.Registry, self.cb_ref);
+
+        if (r) {
+            self.lua.call(0, 0);
+        } else |err| {
+            self.lua.pushString(@errorName(err));
+            self.lua.call(1, 0);
+        }
+
+        return .disarm;
+    }
+};

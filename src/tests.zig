@@ -12,7 +12,7 @@ test "luaopen_xev" {
     const state = try zlj.State.init(.{ .allocator = &alloc.allocator() });
     defer state.deinit();
 
-    state.openLibs();
+    state.openPackage();
 
     state.pushCFunction(luaxev.luaopen_xev);
     state.call(0, 0);
@@ -30,7 +30,7 @@ test "xev.Loop.new" {
     const state = try zlj.State.init(.{ .allocator = &alloc.allocator() });
     defer state.deinit();
 
-    state.openLibs();
+    state.openPackage();
 
     state.pushCFunction(luaxev.luaopen_xev);
     state.call(0, 0);
@@ -49,39 +49,76 @@ test "xev.Loop.new" {
     try loop.run(.until_done);
 }
 
-test "xev.File.open" {
+test "xev.File.open/close" {
+    //     var loop = try xev.Loop.init(.{});
+    //
+    //     const f = try std.fs.cwd().openFile("src/testdata/file.txt", .{});
+    //
+    //     const file = xev.File.initFd(f.handle);
+    //     var c: xev.Completion = undefined;
+    //
+    //     const UserData = struct {
+    //         const Self = @This();
+    //
+    //         fn callback(_:?*Self, _:*xev.Loop, _:*xev.Completion, _:xev.File, _:xev.CloseError!void, )xev.CallbackAction {
+    //             return .disarm;
+    //         }
+    // };
+    //     var udata: UserData = undefined;
+    //
+    //     file.close(&loop, &c, UserData, &udata, UserData.callback);
+    //
+    //     try loop.run(.until_done);
+
     var alloc = std.heap.DebugAllocator(.{}).init;
     defer _ = alloc.deinit();
 
     const state = try zlj.State.init(.{ .allocator = &alloc.allocator() });
     defer state.deinit();
 
-    state.openLibs();
+    state.openPackage();
+    state.openBase();
+
+    const f = try std.fs.cwd().openFile("src/testdata/file.txt", .{});
 
     state.pushCFunction(luaxev.luaopen_xev);
     state.call(0, 0);
 
     try state.doString(
-        \\  function test()
+        \\  function test(fd)
         \\      local xev = require("xev")
-        \\      return xev.File.open(0)
+        \\      local loop = xev.Loop.new()
+        \\
+        \\      local f = xev.File.open(fd)
+        \\      local closed = false
+        \\      f:close(loop, function() closed = true end)
+        \\
+        \\      loop:run("no_wait")
+        \\
+        \\      return closed, f
         \\  end
     , null);
     state.getGlobal("test");
-    state.call(0, 1);
+    state.pushAnyType(f.handle);
+    state.pCall(1, 2, 0) catch {
+        state.dumpStack();
+        @panic("err");
+    };
 
     _ = state.checkUserData(-1, xev.File, "xev.File");
-    _ = state.toUserData(-1, xev.File).?;
+
+    const closed = state.toBoolean(-2);
+    try testing.expect(closed);
 }
 
-test "xev.File.read" {
+test "xev.File.read/pread" {
     var alloc = std.heap.DebugAllocator(.{}).init;
     defer _ = alloc.deinit();
 
     const state = try zlj.State.init(.{ .allocator = &alloc.allocator() });
     defer state.deinit();
 
-    state.openLibs();
+    state.openPackage();
 
     state.pushCFunction(luaxev.luaopen_xev);
     state.call(0, 0);
@@ -93,24 +130,80 @@ test "xev.File.read" {
         \\  function test(fd)
         \\      local xev = require("xev")
         \\      local loop = xev.Loop.new()
-        \\      local comp = xev.Completion.new()
-        \\      local buf = xev.ReadBuffer.new()
-        \\      local str = ""
+        \\      local buf1 = xev.ReadBuffer.new()
+        \\      local buf2 = xev.ReadBuffer.new()
+        \\      local read_str = ""
+        \\      local pread_str = ""
         \\
         \\      local f = xev.File.open(fd)
-        \\      f:read(loop, comp, buf, function() str = buf:tostring() end)
+        \\      f:read(loop, buf1, function() read_str = buf1:tostring() end)
+        \\      f:pread(loop, buf2, 6, function() pread_str = buf2:tostring() end)
         \\      loop:run("until_done")
         \\
-        \\      return str
+        \\      return read_str, pread_str
         \\  end
     , null);
     state.getGlobal("test");
     state.pushAnyType(f.handle);
-    state.call(1, 1);
+    state.call(1, 2);
 
+    try testing.expectEqualStrings(
+        "world!\n",
+        state.popAnyType([]const u8).?,
+    );
     try testing.expectEqualStrings(
         "Hello world!\n",
         state.popAnyType([]const u8).?,
     );
 }
 
+test "xev.File.write/prwrite" {
+    var alloc = std.heap.DebugAllocator(.{}).init;
+    defer _ = alloc.deinit();
+
+    const state = try zlj.State.init(.{ .allocator = &alloc.allocator() });
+    defer state.deinit();
+
+    state.openPackage();
+
+    state.pushCFunction(luaxev.luaopen_xev);
+    state.call(0, 0);
+
+    const f = try std.fs.cwd().createFile(
+        "src/testdata/tmp.txt",
+        .{ .read = true, .truncate = true },
+    );
+    defer f.close();
+    defer _ = std.fs.cwd().deleteFile("src/testdata/tmp.txt") catch unreachable;
+
+    try state.doString(
+        \\  function test(fd)
+        \\      local xev = require("xev")
+        \\      local loop = xev.Loop.new()
+        \\      local write = false
+        \\      local pwrite = false
+        \\
+        \\      local f = xev.File.open(fd)
+        \\      f:write(loop, "hello from lua!", function() write = true end)
+        \\      loop:run("until_done")
+        \\
+        \\      f:pwrite(loop, "earth", 11, function() pwrite = true end)
+        \\      loop:run("until_done")
+        \\
+        \\      return write, pwrite
+        \\  end
+    , null);
+    state.getGlobal("test");
+    state.pushAnyType(f.handle);
+    state.call(1, 2);
+
+    try testing.expect(state.toBoolean(-2));
+    try testing.expect(state.toBoolean(-1));
+
+    try f.seekTo(0);
+
+    var buf: [1024]u8 = undefined;
+    const read = try f.read(buf[0..]);
+
+    try testing.expectEqualStrings("hello from earth", buf[0..read]);
+}
