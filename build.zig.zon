@@ -37,12 +37,12 @@
     // internet connectivity.
     .dependencies = .{
         .libxev = .{
-            .url = "git+https://github.com/mitchellh/libxev#5647630d7bff969414a0edc24c03c30aff34b101",
-            .hash = "libxev-0.0.0-86vtc4b1EgCl0Kvo2Ixmjfl5PgAaJmvCXRIn_n89nCaR",
+            .url = "git+https://github.com/negrel/libxev#84fe76c37ffe7bd949839b655d4feba4acae5c18",
+            .hash = "libxev-0.0.0-86vtcykuEwBVi0LEutJBQ5Q2PKtpGNOZ54LfY1PAC8If",
         },
         .zluajit = .{
-            .url = "git+https://github.com/negrel/zluajit#deccc244c0a348c06acc288a1f8ed08fcc1c2153",
-            .hash = "zluajit-0.0.0-uJQ3fo1AAgCeAbxOSegNPE86gCdixy-ye_sYR4fhxS2W",
+            .url = "git+https://github.com/negrel/zluajit#b1fdef72b5cf47c5af2a8becc5d75cc3140c37bb",
+            .hash = "zluajit-0.0.0-uJQ3fnVZAgBqAlVN_DDY4MqGXZfW7LkGW31bhGiUqjhE",
         },
     },
     .paths = .{
