@@ -27,12 +27,20 @@ pub export fn luaopen_xev(l: ?*zlj.c.lua_State) callconv(.c) c_int {
         file.set("open", File.open);
     }
 
-    // ReadBuffer.
+    // Buffer.
     {
         lua.newTable();
         const read_buffer = lua.toAnyType(zlj.TableRef, -1).?;
-        mod.set("ReadBuffer", read_buffer);
+        mod.set("Buffer", read_buffer);
         read_buffer.set("new", Buffer.new);
+    }
+
+    // WriteQueue.
+    {
+        lua.newTable();
+        const writeQueue = lua.toAnyType(zlj.TableRef, -1).?;
+        mod.set("WriteQueue", writeQueue);
+        writeQueue.set("new", WriteQueue.new);
     }
 
     return 0;
@@ -42,14 +50,16 @@ fn getAlloc(lua: zlj.State) std.mem.Allocator {
     return (lua.allocator() orelse &std.heap.c_allocator).*;
 }
 
-const Loop = struct {
+pub const Loop = struct {
     const Self = @This();
-    const tname = "xev.Loop";
+    pub const zluajitTName = "xev.Loop";
+
+    loop: xev.Loop,
 
     fn new(lua: zlj.State) !c_int {
-        const loop = lua.newUserData(xev.Loop);
+        const self = lua.newUserData(Self);
 
-        if (lua.newMetaTable(xev.Loop, Self.tname)) {
+        if (lua.newMetaTable(Self)) {
             const mt = lua.toAnyType(zlj.TableRef, -1).?;
 
             // Meta methods.
@@ -67,15 +77,15 @@ const Loop = struct {
                 mt.set("__index", index);
             }
         }
-        lua.setMetaTable(1);
+        lua.setMetaTable(-2);
 
-        loop.* = try xev.Loop.init(.{});
+        self.loop = try xev.Loop.init(.{});
 
         return 1;
     }
 
     fn run(lua: zlj.State) !c_int {
-        const loop = lua.checkUserData(1, xev.Loop, Self.tname);
+        var loop = &lua.checkUserData(1, Self).loop;
         const mode = lua.checkEnum(2, xev.RunMode, null);
 
         try loop.run(mode);
@@ -84,21 +94,23 @@ const Loop = struct {
     }
 };
 
-const File = struct {
+pub const File = struct {
     const Self = @This();
-    const tname = "xev.File";
+    pub const zluajitTName = "xev.File";
+
+    file: xev.File,
 
     fn open(lua: zlj.State) c_int {
         const fd = lua.checkAnyType(1, std.fs.File.Handle);
 
-        const f = lua.newUserData(xev.File);
+        const self = lua.newUserData(Self);
 
-        if (lua.newMetaTable(xev.File, Self.tname)) {
+        if (lua.newMetaTable(Self)) {
             const mt = lua.toAnyType(zlj.TableRef, -1).?;
 
             // Meta methods.
             {
-                mt.set("__gc", zlj.wrapFn(xev.File.deinit));
+                mt.set("__gc", Self.deinit);
                 mt.set("__metatable", false);
             }
 
@@ -110,143 +122,238 @@ const File = struct {
                 index.set("read", Self.read);
                 index.set("pread", Self.pread);
                 index.set("write", Self.write);
+                index.set("queueWrite", Self.queueWrite);
                 index.set("pwrite", Self.pwrite);
+                index.set("queuePWrite", Self.queuePWrite);
                 index.set("close", Self.close);
                 mt.set("__index", index);
             }
         }
-        lua.setMetaTable(2);
+        lua.setMetaTable(-2);
 
-        f.* = xev.File.initFd(fd);
+        self.file = xev.File.initFd(fd);
 
         return 1;
     }
 
-    pub fn read(lua: zlj.State) !c_int {
-        const f = lua.checkUserData(1, xev.File, Self.tname);
-        const loop = lua.checkUserData(2, xev.Loop, Loop.tname);
-        const buf = lua.checkUserData(3, Buffer, Buffer.tname);
+    fn deinit(self: *const Self) void {
+        self.file.deinit();
+    }
+
+    fn read(lua: zlj.State) !c_int {
+        const f = &lua.checkUserData(1, Self).file;
+        const loop = &lua.checkUserData(2, Loop).loop;
+        const buf = lua.checkUserData(3, Buffer);
         lua.checkValueType(4, .function); // Callback.
         lua.setTop(4);
 
-        const callback = try ReadCallback.init(lua);
+        const callback = try ReadCallback.init(lua, .{
+            .lua_callback = try lua.refValue(zlj.Registry, 4),
+            .lua_buffer = try lua.refValue(zlj.Registry, 3),
+        });
 
         f.read(
             loop,
-            try getAlloc(lua).create(xev.Completion),
+            &callback.completion,
             .{ .slice = buf.slice },
             ReadCallback,
             callback,
-            ReadCallback.readCallback,
+            ReadCallback.read,
         );
 
         return 0;
     }
 
-    pub fn pread(lua: zlj.State) !c_int {
-        const f = lua.checkUserData(1, xev.File, Self.tname);
-        const loop = lua.checkUserData(2, xev.Loop, Loop.tname);
-        const buf = lua.checkUserData(3, Buffer, Buffer.tname);
+    fn pread(lua: zlj.State) !c_int {
+        const f = &lua.checkUserData(1, Self).file;
+        const loop = &lua.checkUserData(2, Loop).loop;
+        const buf = lua.checkUserData(3, Buffer);
         const offset: usize = @intCast(lua.checkLong(4));
         lua.checkValueType(5, .function); // Callback.
         lua.setTop(5);
 
-        // Remove offset from stack.
-        lua.remove(4);
-        const callback = try ReadCallback.init(lua);
+        const callback = try ReadCallback.init(lua, .{
+            .lua_callback = try lua.refValue(zlj.Registry, 5),
+            .lua_buffer = try lua.refValue(zlj.Registry, 3),
+        });
+
         f.pread(
             loop,
-            try getAlloc(lua).create(xev.Completion),
+            &callback.completion,
             .{ .slice = buf.slice },
             offset,
             ReadCallback,
             callback,
-            ReadCallback.readCallback,
+            ReadCallback.read,
         );
 
         return 0;
     }
 
-    pub fn write(lua: zlj.State) !c_int {
-        const f = lua.checkUserData(1, xev.File, Self.tname);
-        const loop = lua.checkUserData(2, xev.Loop, Loop.tname);
-        const str = lua.checkString(3);
+    fn write(lua: zlj.State) !c_int {
+        const f = &lua.checkUserData(1, Self).file;
+        const loop = &lua.checkUserData(2, Loop).loop;
+        const buf = Buffer.fromLuaArg(lua, 3);
         lua.checkValueType(4, .function); // Callback.
         lua.setTop(4);
 
-        const callback = try WriteCallback.init(lua);
+        const callback = try WriteCallback.init(lua, .{
+            .lua_callback = try lua.refValue(zlj.Registry, 4),
+            .lua_buffer = try lua.refValue(zlj.Registry, 3),
+        });
+
         f.write(
             loop,
-            try getAlloc(lua).create(xev.Completion),
-            .{ .slice = str },
+            &callback.completion,
+            .{ .slice = buf },
             WriteCallback,
             callback,
-            WriteCallback.writeCallback,
+            WriteCallback.write,
         );
 
         return 0;
     }
 
-    pub fn pwrite(lua: zlj.State) !c_int {
-        const f = lua.checkUserData(1, xev.File, Self.tname);
-        const loop = lua.checkUserData(2, xev.Loop, Loop.tname);
-        const str = lua.checkString(3);
+    fn queueWrite(lua: zlj.State) !c_int {
+        const f = &lua.checkUserData(1, Self).file;
+        const loop = &lua.checkUserData(2, Loop).loop;
+        const q = &lua.checkUserData(3, WriteQueue).wqueue;
+        const buf = Buffer.fromLuaArg(lua, 4);
+        lua.checkValueType(5, .function); // Callback.
+        lua.setTop(5);
+
+        const req = try getAlloc(lua).create(xev.WriteRequest);
+        const callback = try QWriteCallback.init(lua, .{
+            .lua_callback = try lua.refValue(zlj.Registry, 5),
+            .lua_buffer = try lua.refValue(zlj.Registry, 4),
+            .write_request = req,
+        });
+
+        f.queueWrite(
+            loop,
+            q,
+            req,
+            .{ .slice = buf },
+            QWriteCallback,
+            callback,
+            QWriteCallback.write,
+        );
+
+        return 0;
+    }
+
+    fn pwrite(lua: zlj.State) !c_int {
+        const f = lua.checkUserData(1, Self).file;
+        const loop = &lua.checkUserData(2, Loop).loop;
+        const buf = Buffer.fromLuaArg(lua, 3);
         const offset: usize = @intCast(lua.checkLong(4));
         lua.checkValueType(5, .function); // Callback.
         lua.setTop(5);
 
-        const callback = try WriteCallback.init(lua);
+        const callback = try WriteCallback.init(lua, .{
+            .lua_callback = try lua.refValue(zlj.Registry, 5),
+            .lua_buffer = try lua.refValue(zlj.Registry, 3),
+        });
+
         f.pwrite(
             loop,
-            try getAlloc(lua).create(xev.Completion),
-            .{ .slice = str },
+            &callback.completion,
+            .{ .slice = buf },
             offset,
             WriteCallback,
             callback,
-            WriteCallback.writeCallback,
+            WriteCallback.write,
         );
 
         return 0;
     }
 
-    pub fn close(lua: zlj.State) !c_int {
-        const f = lua.checkUserData(1, xev.File, Self.tname);
-        const loop = lua.checkUserData(2, xev.Loop, Loop.tname);
+    fn queuePWrite(lua: zlj.State) !c_int {
+        const f = lua.checkUserData(1, Self).file;
+        const loop = &lua.checkUserData(2, Loop).loop;
+        const q = &lua.checkUserData(3, WriteQueue).wqueue;
+        const buf = Buffer.fromLuaArg(lua, 4);
+        const offset: usize = @intCast(lua.checkLong(5));
+        lua.checkValueType(6, .function); // Callback.
+        lua.setTop(6);
+
+        const req = try getAlloc(lua).create(xev.WriteRequest);
+        const callback = try QWriteCallback.init(lua, .{
+            .lua_callback = try lua.refValue(zlj.Registry, 6),
+            .lua_buffer = try lua.refValue(zlj.Registry, 4),
+            .write_request = req,
+        });
+
+        f.queuePWrite(
+            loop,
+            q,
+            req,
+            .{ .slice = buf },
+            offset,
+            QWriteCallback,
+            callback,
+            QWriteCallback.write,
+        );
+
+        return 0;
+    }
+
+    fn close(lua: zlj.State) !c_int {
+        const f = &lua.checkUserData(1, Self).file;
+        const loop = &lua.checkUserData(2, Loop).loop;
         lua.checkValueType(3, zlj.ValueType.function); // Callback.
+        lua.setTop(3);
 
-        // Remove extra args.
-        if (lua.top() > 3) lua.pop(lua.top() - 3);
-
-        const callback = try CloseCallback.init(lua);
+        const callback = try CloseCallback.init(lua, .{
+            .lua_callback = try lua.refValue(zlj.Registry, 3),
+        });
 
         f.close(
             loop,
-            try getAlloc(lua).create(xev.Completion),
+            &callback.completion,
             CloseCallback,
             callback,
-            CloseCallback.closeCallback,
+            CloseCallback.close,
         );
 
         return 0;
     }
 };
 
-const Buffer = struct {
+pub const Buffer = struct {
     const Self = @This();
-    const tname = "xev.Buffer";
+    pub const zluajitTName = "xev.Buffer";
 
     slice: []u8,
     len: usize = 0,
 
-    pub fn new(lua: zlj.State) !c_int {
-        var size = lua.optInteger(1, 4096);
-        if (size < 0) size = 0;
+    fn new(lua: zlj.State) !c_int {
+        var size: usize = 4096;
+        var str: []const u8 = "";
+
+        if (!lua.isNoneOrNil(1)) {
+            const vtype = lua.valueType(1);
+            if (vtype != .string and vtype != .number)
+                return lua.argError(1, "expected string or number");
+            if (vtype == .string) {
+                str = lua.toString(1).?;
+                size = str.len;
+            } else {
+                size = @intCast(lua.toInteger(1));
+            }
+
+            size = @max(
+                size,
+                @as(usize, @intCast(lua.optInteger(2, -1))),
+            );
+        }
 
         const self = lua.newUserData(Self);
         const alloc = (lua.allocator() orelse &std.heap.c_allocator).*;
         self.slice = try alloc.alloc(u8, @intCast(size));
+        std.mem.copyForwards(u8, self.slice, str);
 
-        if (lua.newMetaTable(xev.Completion, Self.tname)) {
+        if (lua.newMetaTable(Self)) {
             const mt = lua.toAnyType(zlj.TableRef, -1).?;
 
             // Meta methods.
@@ -265,176 +372,224 @@ const Buffer = struct {
                 mt.set("__index", index);
             }
         }
-        lua.setMetaTable(1);
+        lua.setMetaTable(-2);
 
         return 1;
     }
 
-    pub fn gc(lua: zlj.State) c_int {
-        const self = lua.checkUserData(1, Self, Self.tname);
+    fn fromLuaArg(lua: zlj.State, narg: c_int) []const u8 {
+        const vtype = lua.valueType(narg);
+        if (vtype != .string and vtype != .userdata)
+            _ = lua.argError(narg, "string or xev.Buffer expected");
+
+        if (vtype == .string) return lua.toString(narg).?;
+
+        const self = lua.checkUserData(narg, Self);
+        return self.slice;
+    }
+
+    fn gc(lua: zlj.State) c_int {
+        const self = lua.checkUserData(1, Self);
         const alloc = (lua.allocator() orelse &std.heap.c_allocator).*;
         alloc.free(self.slice);
         return 0;
     }
 
-    pub fn toString(lua: zlj.State) c_int {
-        const self = lua.checkUserData(1, Self, "xev.Buffer");
+    fn toString(lua: zlj.State) c_int {
+        const self = lua.checkUserData(1, Self);
         lua.pushString(self.slice[0..self.len]);
         return 1;
     }
 };
 
-const ReadCallback = struct {
+pub const WriteQueue = struct {
     const Self = @This();
+    pub const zluajitTName = "xev.WriteQueue";
 
-    alloc: std.mem.Allocator,
-    lua: zlj.State,
-    cb_ref: c_int,
-    buf_ref: c_int,
+    wqueue: xev.WriteQueue,
 
-    /// Initialize a Callback using function and buffer on top of the stack.
-    pub fn init(lua: zlj.State) !*Self {
-        const alloc = getAlloc(lua);
-        const self = try alloc.create(Self);
-        self.alloc = alloc;
-        self.lua = lua;
-        self.cb_ref = try lua.ref(zlj.Registry);
-        self.buf_ref = try lua.ref(zlj.Registry);
-        return self;
-    }
+    fn new(lua: zlj.State) !c_int {
+        const self = lua.newUserData(Self);
 
-    fn deinit(self: *Self) void {
-        self.lua.unref(zlj.Registry, self.cb_ref);
-        self.lua.unref(zlj.Registry, self.buf_ref);
-        self.alloc.destroy(self);
-    }
+        if (lua.newMetaTable(Self)) {
+            const mt = lua.toAnyType(zlj.TableRef, -1).?;
 
-    pub fn readCallback(
-        ud: ?*ReadCallback,
-        _: *xev.Loop,
-        c: *xev.Completion,
-        _: xev.File,
-        _: xev.ReadBuffer,
-        r: xev.ReadError!usize,
-    ) xev.CallbackAction {
-        const self = ud.?;
+            // Meta methods.
+            {
+                mt.set("__gc", false);
+                mt.set("__metatable", false);
+            }
 
-        self.lua.rawGeti(zlj.Registry, self.cb_ref);
-
-        if (r) |read| {
-            self.lua.rawGeti(zlj.Registry, self.buf_ref);
-            const buf = self.lua.popAnyType(*Buffer).?;
-            buf.len = read;
-            self.lua.pushInteger(@intCast(read));
-            self.lua.call(1, 1);
-        } else |err| {
-            self.lua.pushInteger(0);
-            self.lua.pushString(@errorName(err));
-            self.lua.call(2, 1);
+            // Create __index table.
+            {
+                lua.newTable();
+                const index = lua.toAnyType(zlj.TableRef, -1).?;
+                defer lua.pop(1);
+                mt.set("__index", index);
+            }
         }
+        lua.setMetaTable(-2);
 
-        if (self.lua.toBoolean(-1)) return .rearm;
+        self.wqueue.head = null;
+        self.wqueue.tail = null;
 
-        self.deinit();
-        self.alloc.destroy(c);
-
-        return .disarm;
+        return 1;
     }
 };
 
-const WriteCallback = struct {
-    const Self = @This();
+fn Callback(Data: type) type {
+    return struct {
+        const Self = @This();
 
-    alloc: std.mem.Allocator,
-    lua: zlj.State,
-    cb_ref: c_int,
+        alloc: std.mem.Allocator,
+        lua: zlj.State,
+        completion: xev.Completion,
+        data: Data,
 
-    /// Initialize a Callback using function and buffer on top of the stack.
-    pub fn init(lua: zlj.State) !*Self {
-        const alloc = getAlloc(lua);
-        const self = try alloc.create(Self);
-        self.alloc = alloc;
-        self.lua = lua;
-        self.cb_ref = try lua.ref(zlj.Registry);
-        return self;
-    }
+        fn init(lua: zlj.State, data: Data) !*Self {
+            const alloc = getAlloc(lua);
+            const self = try alloc.create(Self);
+            self.alloc = alloc;
+            self.lua = lua;
+            self.data = data;
 
-    fn deinit(self: *Self) void {
-        self.lua.unref(zlj.Registry, self.cb_ref);
-        self.alloc.destroy(self);
-    }
-
-    pub fn writeCallback(
-        ud: ?*WriteCallback,
-        _: *xev.Loop,
-        c: *xev.Completion,
-        _: xev.File,
-        _: xev.WriteBuffer,
-        r: xev.WriteError!usize,
-    ) xev.CallbackAction {
-        const self = ud.?;
-
-        self.lua.rawGeti(zlj.Registry, self.cb_ref);
-
-        if (r) |write| {
-            self.lua.pushInteger(@intCast(write));
-            self.lua.call(1, 1);
-        } else |err| {
-            self.lua.pushInteger(0);
-            self.lua.pushString(@errorName(err));
-            self.lua.call(2, 1);
+            return self;
         }
 
-        if (self.lua.toBoolean(-1)) return .rearm;
-
-        self.deinit();
-        self.alloc.destroy(c);
-
-        return .disarm;
-    }
-};
-
-const CloseCallback = struct {
-    const Self = @This();
-
-    alloc: std.mem.Allocator,
-    lua: zlj.State,
-    cb_ref: c_int,
-
-    /// Initialize a Callback using function on top of the stack.
-    pub fn init(lua: zlj.State) !*Self {
-        const alloc = getAlloc(lua);
-        const self = try alloc.create(Self);
-        self.alloc = alloc;
-        self.lua = lua;
-        self.cb_ref = try lua.ref(zlj.Registry);
-        return self;
-    }
-
-    fn deinit(self: *Self) void {
-        self.alloc.destroy(self);
-    }
-
-    pub fn closeCallback(
-        ud: ?*CloseCallback,
-        _: *xev.Loop,
-        c: *xev.Completion,
-        _: xev.File,
-        r: xev.CloseError!void,
-    ) xev.CallbackAction {
-        const self = ud.?;
-        defer self.deinit();
-        defer self.alloc.destroy(c);
-
-        self.lua.rawGeti(zlj.Registry, self.cb_ref);
-
-        if (r) {
-            self.lua.call(0, 0);
-        } else |err| {
-            self.lua.pushString(@errorName(err));
-            self.lua.call(1, 0);
+        fn deinit(self: *Self) void {
+            self.data.deinit(self.lua);
+            self.alloc.destroy(self);
         }
 
-        return .disarm;
+        fn read(
+            ud: ?*Self,
+            _: *xev.Loop,
+            _: *xev.Completion,
+            _: xev.File,
+            _: xev.ReadBuffer,
+            r: xev.ReadError!usize,
+        ) xev.CallbackAction {
+            const self = ud.?;
+            defer self.deinit();
+
+            self.lua.rawGeti(zlj.Registry, self.data.lua_callback);
+
+            if (r) |bRead| {
+                self.lua.rawGeti(zlj.Registry, self.data.lua_buffer);
+                const buf = self.lua.popAnyType(*Buffer).?;
+                buf.len = bRead;
+                self.lua.pushInteger(@intCast(bRead));
+                self.lua.call(1, 1);
+            } else |err| {
+                self.lua.pushInteger(0);
+                self.lua.pushString(@errorName(err));
+                self.lua.call(2, 1);
+            }
+
+            if (self.lua.toBoolean(-1)) return .rearm;
+
+            return .disarm;
+        }
+
+        fn write(
+            ud: ?*Self,
+            _: *xev.Loop,
+            _: *xev.Completion,
+            _: xev.File,
+            _: xev.WriteBuffer,
+            r: xev.WriteError!usize,
+        ) xev.CallbackAction {
+            const self = ud.?;
+            defer self.deinit();
+
+            if (@hasField(Self, "write_request")) {
+                defer self.alloc.destroy(@field(self, "write_request"));
+            }
+
+            self.lua.rawGeti(zlj.Registry, self.data.lua_callback);
+
+            if (r) |bWrite| {
+                self.lua.pushInteger(@intCast(bWrite));
+                self.lua.call(1, 1);
+            } else |err| {
+                self.lua.pushInteger(0);
+                self.lua.pushString(@errorName(err));
+                self.lua.call(2, 1);
+            }
+
+            if (self.lua.toBoolean(-1)) return .rearm;
+
+            return .disarm;
+        }
+
+        fn close(
+            ud: ?*Self,
+            _: *xev.Loop,
+            _: *xev.Completion,
+            _: xev.File,
+            r: xev.CloseError!void,
+        ) xev.CallbackAction {
+            const self = ud.?;
+            defer self.deinit();
+
+            self.lua.rawGeti(zlj.Registry, self.data.lua_callback);
+
+            if (r) {
+                self.lua.call(0, 0);
+            } else |err| {
+                self.lua.pushString(@errorName(err));
+                self.lua.call(1, 0);
+            }
+
+            return .disarm;
+        }
+    };
+}
+
+const ReadCallback = Callback(struct {
+    const Self = @This();
+
+    lua_callback: c_int,
+    lua_buffer: c_int,
+
+    fn deinit(self: Self, lua: zlj.State) void {
+        lua.unref(zlj.Registry, self.lua_callback);
+        lua.unref(zlj.Registry, self.lua_buffer);
     }
-};
+});
+
+const WriteCallback = Callback(struct {
+    const Self = @This();
+
+    lua_callback: c_int,
+    lua_buffer: c_int,
+
+    fn deinit(self: Self, lua: zlj.State) void {
+        lua.unref(zlj.Registry, self.lua_callback);
+        lua.unref(zlj.Registry, self.lua_buffer);
+    }
+});
+
+const QWriteCallback = Callback(struct {
+    const Self = @This();
+
+    lua_callback: c_int,
+    lua_buffer: c_int,
+    write_request: *xev.WriteRequest,
+
+    fn deinit(self: Self, lua: zlj.State) void {
+        lua.unref(zlj.Registry, self.lua_callback);
+        lua.unref(zlj.Registry, self.lua_buffer);
+        getAlloc(lua).destroy(self.write_request);
+    }
+});
+
+const CloseCallback = Callback(struct {
+    const Self = @This();
+
+    lua_callback: c_int,
+
+    fn deinit(self: Self, lua: zlj.State) void {
+        lua.unref(zlj.Registry, self.lua_callback);
+    }
+});

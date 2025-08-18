@@ -44,32 +44,11 @@ test "xev.Loop.new" {
     state.getGlobal("test");
     state.call(0, 1);
 
-    _ = state.checkUserData(-1, xev.Loop, "xev.Loop");
-    const loop = state.toUserData(-1, xev.Loop).?;
+    var loop = &state.checkUserData(-1, luaxev.Loop).loop;
     try loop.run(.until_done);
 }
 
 test "xev.File.open/close" {
-    //     var loop = try xev.Loop.init(.{});
-    //
-    //     const f = try std.fs.cwd().openFile("src/testdata/file.txt", .{});
-    //
-    //     const file = xev.File.initFd(f.handle);
-    //     var c: xev.Completion = undefined;
-    //
-    //     const UserData = struct {
-    //         const Self = @This();
-    //
-    //         fn callback(_:?*Self, _:*xev.Loop, _:*xev.Completion, _:xev.File, _:xev.CloseError!void, )xev.CallbackAction {
-    //             return .disarm;
-    //         }
-    // };
-    //     var udata: UserData = undefined;
-    //
-    //     file.close(&loop, &c, UserData, &udata, UserData.callback);
-    //
-    //     try loop.run(.until_done);
-
     var alloc = std.heap.DebugAllocator(.{}).init;
     defer _ = alloc.deinit();
 
@@ -105,7 +84,7 @@ test "xev.File.open/close" {
         @panic("err");
     };
 
-    _ = state.checkUserData(-1, xev.File, "xev.File");
+    _ = state.checkUserData(-1, luaxev.File);
 
     const closed = state.toBoolean(-2);
     try testing.expect(closed);
@@ -130,8 +109,8 @@ test "xev.File.read/pread" {
         \\  function test(fd)
         \\      local xev = require("xev")
         \\      local loop = xev.Loop.new()
-        \\      local buf1 = xev.ReadBuffer.new()
-        \\      local buf2 = xev.ReadBuffer.new()
+        \\      local buf1 = xev.Buffer.new()
+        \\      local buf2 = xev.Buffer.new()
         \\      local read_str = ""
         \\      local pread_str = ""
         \\
@@ -191,6 +170,56 @@ test "xev.File.write/prwrite" {
         \\      loop:run("until_done")
         \\
         \\      return write, pwrite
+        \\  end
+    , null);
+    state.getGlobal("test");
+    state.pushAnyType(f.handle);
+    state.call(1, 2);
+
+    try testing.expect(state.toBoolean(-2));
+    try testing.expect(state.toBoolean(-1));
+
+    try f.seekTo(0);
+
+    var buf: [1024]u8 = undefined;
+    const read = try f.read(buf[0..]);
+
+    try testing.expectEqualStrings("hello from earth", buf[0..read]);
+}
+
+test "xev.File.queueWrite/queuePWrite" {
+    var alloc = std.heap.DebugAllocator(.{}).init;
+    defer _ = alloc.deinit();
+
+    const state = try zlj.State.init(.{ .allocator = &alloc.allocator() });
+    defer state.deinit();
+
+    state.openPackage();
+
+    state.pushCFunction(luaxev.luaopen_xev);
+    state.call(0, 0);
+
+    const f = try std.fs.cwd().createFile(
+        "src/testdata/tmp.txt",
+        .{ .read = true, .truncate = true },
+    );
+    defer f.close();
+    defer _ = std.fs.cwd().deleteFile("src/testdata/tmp.txt") catch unreachable;
+
+    try state.doString(
+        \\  function test(fd)
+        \\      local xev = require("xev")
+        \\      local loop = xev.Loop.new()
+        \\      local wqueue = xev.WriteQueue.new()
+        \\      local qwrite = false
+        \\      local qpwrite = false
+        \\
+        \\      local f = xev.File.open(fd)
+        \\      f:queueWrite(loop, wqueue, "hello from lua!", function() qwrite = true end)
+        \\      f:queuePWrite(loop, wqueue, "earth", 11, function() qpwrite = true end)
+        \\      loop:run("until_done")
+        \\
+        \\      return qwrite, qpwrite
         \\  end
     , null);
     state.getGlobal("test");
